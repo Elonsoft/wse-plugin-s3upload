@@ -21,6 +21,9 @@ import java.util.Timer;
 import java.util.TimerTask;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 
 import com.amazonaws.AmazonServiceException;
 import com.amazonaws.auth.AWSCredentialsProvider;
@@ -62,12 +65,14 @@ public class ModuleS3Upload extends ModuleBase
 {
 	private class UploadTask extends TimerTask
 	{
+		private final String streamName;
 		private final String mediaName;
 		private final long delay;
 		private long lastAge = 0;
 
-		UploadTask(String mediaName, long delay, long age)
+		UploadTask(String streamName, String mediaName, long delay, long age)
 		{
+			this.streamName = streamName;
 			this.mediaName = mediaName;
 			this.delay = delay;
 			lastAge = age;
@@ -137,7 +142,7 @@ public class ModuleS3Upload extends ModuleBase
 			{
 				if (debugLog)
 					logger.info(MODULE_NAME + ".UploadTask.run() starting upload [" + appInstance.getContextStr() + "/" + mediaName + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				startUpload(mediaName);
+				startUpload(streamName, mediaName);
 			}
 		}
 	}
@@ -189,7 +194,7 @@ public class ModuleS3Upload extends ModuleBase
 					}
 					uploadFile.createNewFile();
 					if (!shuttingDown)
-						startUpload(mediaName, uploadDelay);
+						startUpload(stream.getName(), mediaName, uploadDelay);
 				}
 				catch (IOException e)
 				{
@@ -207,11 +212,13 @@ public class ModuleS3Upload extends ModuleBase
 
 	private class ProgressListener extends S3SyncProgressListener
 	{
+		final String streamName;
 		final String mediaName;
 		final String uploadName;
 
-		ProgressListener(String mediaName, String uploadName)
+		ProgressListener(String streamName, String mediaName, String uploadName)
 		{
+			this.streamName = streamName;
 			this.mediaName = mediaName;
 			this.uploadName = uploadName;
 		}
@@ -239,6 +246,9 @@ public class ModuleS3Upload extends ModuleBase
 						File mediaFile = new File(storageDir, mediaName);
 						mediaFile.delete();
 					}
+					if (webhookEndpoint != null)
+						sendWebhookRequest(streamName, uploadName, "completed");
+					
 					break;
 
 				case TRANSFER_FAILED_EVENT:
@@ -253,13 +263,16 @@ public class ModuleS3Upload extends ModuleBase
 						if (shuttingDown)
 							break;
 					}
+					
+					if (webhookEndpoint != null)
+						sendWebhookRequest(streamName, uploadName, "failed");
 
 					if (restartFailedUploads)
 					{
 						if (debugLog)
 							logger.info(MODULE_NAME + ".ProgressListener.progressChanged [" + appInstance.getContextStr() + "/" + mediaName + "] event: " + type.toString() + ", restarting upload", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
 						long age = getFileAge(mediaName);
-						startUpload(mediaName, restartFailedUploadsTimeout + age);
+						startUpload(streamName, mediaName, restartFailedUploadsTimeout + age);
 					}
 					break;
 
@@ -335,6 +348,8 @@ public class ModuleS3Upload extends ModuleBase
 	private String filePrefix = null;
 	private String endpoint = null;
 	private String regionName = null;
+	private String streamNameRegex = null;
+	private String webhookEndpoint = null;
 	private File storageDir = null;
 	private Map<String, Timer> uploadTimers = new HashMap<String, Timer>();
 	private List<String> currentUploads = new ArrayList<String>();
@@ -383,6 +398,10 @@ public class ModuleS3Upload extends ModuleBase
 				endpoint = props.getPropertyStr("s3UploadEndpoint", endpoint);
 				regionName = getRegion();
 			}
+			
+			streamNameRegex = props.getPropertyStr("s3UploadStreamNameRegex", streamNameRegex);
+			webhookEndpoint = props.getPropertyStr("s3UploadWebhookEndpoint", webhookEndpoint);
+			
 			// if region or endpoint isn't set then use the default region.
 			// disable if region can be determined via the DefaultAwsRegionProviderChain.
 			useDefaultRegion = props.getPropertyBoolean("s3UploadUseDefaultRegion", useDefaultRegion);
@@ -594,12 +613,14 @@ public class ModuleS3Upload extends ModuleBase
 			else
 			{
 				String mediaName = getMediaName(uploadFile.getPath());
-				startUpload(mediaName, uploadDelay);
+				String streamName = streamNameFromFileName(mediaName);
+				logger.info("mediaName: " + mediaName + " streamName: " + streamName);
+				startUpload(streamName, mediaName, uploadDelay);
 			}
 		}
 	}
 
-	private void startUpload(String mediaName, long delay)
+	private void startUpload(String streamName, String mediaName, long delay)
 	{
 		synchronized(lock)
 		{
@@ -611,7 +632,7 @@ public class ModuleS3Upload extends ModuleBase
 			{
 				t = new Timer("UploadTimer: [" + appInstance.getContextStr() + "/" + mediaName + "]");
 				long timerDelay = Math.min(delay - age, touchTimeout);
-				t.schedule(new UploadTask(mediaName, delay, age), timerDelay, timerDelay / 2);
+				t.schedule(new UploadTask(streamName, mediaName, delay, age), timerDelay, timerDelay / 2);
 				uploadTimers.put(mediaName, t);
 				if (debugLog)
 					logger.info(MODULE_NAME + ".startUpload (delayed) for [" + appInstance.getContextStr() + "/" + mediaName + "] age: " + age + ", delay: " + delay + ", timerDelay: " + timerDelay, WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
@@ -620,12 +641,12 @@ public class ModuleS3Upload extends ModuleBase
 			{
 				if (debugLog)
 					logger.info(MODULE_NAME + ".startUpload (now) for [" + appInstance.getContextStr() + "/" + mediaName + "] age: " + age + ", delay: " + delay, WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				startUpload(mediaName);
+				startUpload(streamName, mediaName);
 			}
 		}
 	}
 
-	private void startUpload(String mediaName)
+	private void startUpload(String streamName, String mediaName)
 	{
 		touchAppInstance();
 
@@ -694,7 +715,7 @@ public class ModuleS3Upload extends ModuleBase
 				if (upload != null)
 				{
 					currentUploads.add(uploadName);
-					upload.addProgressListener(new ProgressListener(mediaName, uploadName));
+					upload.addProgressListener(new ProgressListener(streamName, mediaName, uploadName));
 				}
 			}
 			catch (Exception e)
@@ -879,6 +900,40 @@ public class ModuleS3Upload extends ModuleBase
 				logger.info(MODULE_NAME + " touching appInstance [" + appInstance.getContextStr() + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
 			appInstance.touch();
 			lastTouch = now;
+		}
+	}
+	
+	private void sendWebhookRequest(String streamName, String fileName, String status)
+	{
+		try {
+			HttpURLConnection httpClient = (HttpURLConnection) new URL(webhookEndpoint).openConnection();
+			httpClient.setRequestMethod("POST");
+			httpClient.setDoOutput(true);
+			httpClient.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+			
+			String jsonInputString = String.format("{\"streamName\": \"%s\", \"fileName\": \"%s\", \"status\": \"%s\"}", streamName, fileName, status);
+			try(OutputStream os = httpClient.getOutputStream()) {
+			    byte[] input = jsonInputString.getBytes("UTF-8");
+			    os.write(input, 0, input.length);			
+			}
+			
+			httpClient.getResponseCode();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
+	
+	private String streamNameFromFileName(String fileName)
+	{
+		Pattern pattern = Pattern.compile(streamNameRegex);
+		Matcher matcher = pattern.matcher(fileName);
+		if (matcher.find())
+		{
+			return matcher.group(1);
+		} 
+		else
+		{
+			return null;
 		}
 	}
 }

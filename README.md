@@ -37,3 +37,27 @@ Wowza Media Systems™ provides developers with a platform to create streaming a
 
 ## License
 This code is distributed under the [Wowza Public License](/LICENSE.txt).
+
+## Fork addition
+The fork adds webhook when record was uploaded. To activate the webhook please add variables to the application:
+| Field | Value |
+| ------ | ------ |
+| Path | /Root/Application |
+| Name | s3UploadStreamNameRegex |
+| Type | String |
+| Value | Need to exclude stream name in record filename. For example, value `(.*)_720p.mp4` excludes 123 stream name for file `123_720p.mp4`. It uses for resume an upload. |
+
+| Field | Value |
+| ------ | ------ |
+| Path | /Root/Application |
+| Name | s3UploadWebhookEndpoint |
+| Type | String |
+| Value | Webhook POST url. For example, `https://yourapp.com/records/finish` |
+
+### Webhook JSON body
+
+| Field | Type | Description |
+| ------ | ------ | ------ |
+| streamName | String | name of stream |
+| fileName | String | name of file that was uploaded to AWS S3 |
+| status | String | completed/failed upload status |
